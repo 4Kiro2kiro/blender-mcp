@@ -1126,106 +1126,1145 @@ def import_generated_asset_hunyuan(
         return f"Error generating Hunyuan3D task: {str(e)}"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SCENE AWARENESS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_full_scene_info(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Get a COMPLETE snapshot of the Blender scene: every object (with type,
+    transform, modifiers, materials, bounding box), every light (energy, colour,
+    radius), every camera (focal length, active?), all materials (Principled
+    BSDF values), world environment and render settings.
+
+    Use this at the start of any task to understand what is in the scene, and
+    after any major change to verify results.  Much more detailed than
+    get_scene_info().
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_full_scene_info")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_scene_statistics(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Return quick statistics about the scene: object counts, total vertex /
+    triangle counts, number of materials and images loaded.  Useful for
+    performance awareness.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_scene_statistics")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RENDER
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def render_and_view(ctx: Context,
+                    engine: str = "BLENDER_EEVEE",
+                    samples: int = 64,
+                    resolution_x: int = 1920,
+                    resolution_y: int = 1080,
+                    user_prompt: str = "") -> Image:
+    """
+    Render the current Blender scene and return the image so Claude can see it.
+
+    Parameters:
+    - engine: 'BLENDER_EEVEE' (fast, good quality) or 'CYCLES' (photo-realistic,
+              slow).  Use EEVEE for iteration and CYCLES for final quality.
+    - samples: render quality (32–128 for EEVEE, 128–512 for CYCLES)
+    - resolution_x / resolution_y: output size in pixels
+
+    Use this after making changes to visually verify the result, compare with a
+    reference image, and decide what adjustments are needed.
+    """
+    try:
+        blender = get_blender_connection()
+        temp_path = os.path.join(tempfile.gettempdir(),
+                                 f"blender_render_{os.getpid()}.png")
+        result = blender.send_command("render_frame", {
+            "output_path": temp_path,
+            "engine": engine,
+            "samples": int(samples),
+            "resolution_x": int(resolution_x),
+            "resolution_y": int(resolution_y),
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        if not os.path.exists(temp_path):
+            raise Exception("Render did not produce an output file")
+        with open(temp_path, "rb") as f:
+            data = f.read()
+        os.remove(temp_path)
+        return Image(data=data, format="png")
+    except Exception as e:
+        logger.error(f"render_and_view error: {e}")
+        raise Exception(f"Render failed: {e}")
+
+
+@mcp.tool()
+def get_render_settings(ctx: Context, user_prompt: str = "") -> str:
+    """Return the current render engine, resolution, sample count and other settings."""
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_render_settings")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_render_settings(ctx: Context,
+                         engine: str = None,
+                         resolution_x: int = None,
+                         resolution_y: int = None,
+                         samples: int = None,
+                         film_transparent: bool = None,
+                         output_path: str = None,
+                         file_format: str = None,
+                         use_denoising: bool = None,
+                         user_prompt: str = "") -> str:
+    """
+    Configure Blender's render settings.
+
+    Parameters:
+    - engine: 'CYCLES' or 'BLENDER_EEVEE' / 'BLENDER_EEVEE_NEXT'
+    - resolution_x / resolution_y: pixel dimensions
+    - samples: quality samples (engine-specific)
+    - film_transparent: render alpha channel (True for transparent background)
+    - output_path: where to save renders
+    - file_format: 'PNG', 'JPEG', 'OPEN_EXR', etc.
+    - use_denoising: enable Cycles denoising
+    """
+    try:
+        blender = get_blender_connection()
+        params = {k: v for k, v in {
+            "engine": engine, "resolution_x": resolution_x,
+            "resolution_y": resolution_y, "samples": samples,
+            "film_transparent": film_transparent, "output_path": output_path,
+            "file_format": file_format, "use_denoising": use_denoising,
+        }.items() if v is not None}
+        result = blender.send_command("set_render_settings", params)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Render settings updated: {json.dumps(result)}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIGHTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def add_light(ctx: Context,
+              light_type: str = "POINT",
+              name: str = None,
+              location: list = None,
+              rotation: list = None,
+              energy: float = 1000.0,
+              color: list = None,
+              radius: float = 0.25,
+              spot_size: float = 0.785398,
+              spot_blend: float = 0.15,
+              area_size: float = 1.0,
+              area_shape: str = "SQUARE",
+              sun_angle: float = 0.00918,
+              user_prompt: str = "") -> str:
+    """
+    Add a light to the scene.
+
+    Parameters:
+    - light_type: 'POINT' | 'SUN' | 'SPOT' | 'AREA'
+    - name: name in Blender
+    - location: [x, y, z] in metres
+    - rotation: [rx, ry, rz] in radians (important for SUN / SPOT / AREA)
+    - energy: brightness in Watts
+    - color: [r, g, b] 0–1 values
+    - radius: soft shadow radius (POINT / SPOT)
+    - spot_size: cone angle in radians for SPOT lights
+    - spot_blend: softness of SPOT cone edge
+    - area_size: size in metres for AREA lights
+    - area_shape: 'SQUARE' | 'RECTANGLE' | 'DISK' | 'ELLIPSE'
+    - sun_angle: angular diameter of the sun disc (SUN)
+
+    Professional lighting tips:
+    - Three-point setup: key light (AREA/SPOT), fill light (lower energy POINT),
+      rim/back light (SPOT or AREA behind subject)
+    - Use AREA lights for soft, realistic shadows
+    - Use SUN for outdoor / large-scale scenes
+    - HDRIs (via set_world_environment) provide ambient + reflections
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("add_light", {
+            "light_type": light_type,
+            "name": name,
+            "location": location or [0, 0, 5],
+            "rotation": rotation or [0, 0, 0],
+            "energy": energy,
+            "color": color or [1, 1, 1],
+            "radius": radius,
+            "spot_size": spot_size,
+            "spot_blend": spot_blend,
+            "area_size": area_size,
+            "area_shape": area_shape,
+            "sun_angle": sun_angle,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Light '{result['name']}' added at {result['location']} ({result['type']}, {energy}W)"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def modify_light(ctx: Context,
+                  name: str,
+                  energy: float = None,
+                  color: list = None,
+                  radius: float = None,
+                  spot_size: float = None,
+                  spot_blend: float = None,
+                  area_size: float = None,
+                  location: list = None,
+                  rotation: list = None,
+                  user_prompt: str = "") -> str:
+    """
+    Modify properties of an existing light object.
+    Only provide the parameters you want to change.
+
+    Parameters:
+    - name: name of the light object in the scene
+    - energy: new brightness in Watts
+    - color: [r, g, b] 0–1
+    - location: [x, y, z]
+    - rotation: [rx, ry, rz] in radians
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"name": name}
+        for k, v in {"energy": energy, "color": color, "radius": radius,
+                     "spot_size": spot_size, "spot_blend": spot_blend,
+                     "area_size": area_size, "location": location,
+                     "rotation": rotation}.items():
+            if v is not None:
+                params[k] = v
+        result = blender.send_command("modify_light", params)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Light '{name}' updated: {json.dumps(result)}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAMERAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def add_camera(ctx: Context,
+               name: str = "Camera",
+               location: list = None,
+               rotation: list = None,
+               focal_length: float = 50.0,
+               sensor_width: float = 36.0,
+               clip_start: float = 0.1,
+               clip_end: float = 1000.0,
+               set_active: bool = True,
+               user_prompt: str = "") -> str:
+    """
+    Add a camera to the scene.
+
+    Parameters:
+    - location: [x, y, z] – default is the classic Blender overview position
+    - rotation: [rx, ry, rz] in radians – (1.1, 0, 0.8) ≈ looking at origin
+    - focal_length: lens in mm (24=wide, 50=normal, 85=portrait, 200=telephoto)
+    - sensor_width: sensor size mm (36 = full frame)
+    - set_active: make this the render camera
+
+    Camera focal-length guide:
+    - 12–24mm: ultra wide (architecture, environment)
+    - 35mm: photojournalism / street
+    - 50mm: natural human perspective
+    - 85–135mm: portrait (flattering compression)
+    - 200mm+: telephoto / compression effects
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("add_camera", {
+            "name": name,
+            "location": location or [7.36, -6.93, 4.96],
+            "rotation": rotation or [1.1093, 0.0, 0.8149],
+            "focal_length": focal_length,
+            "sensor_width": sensor_width,
+            "clip_start": clip_start,
+            "clip_end": clip_end,
+            "set_active": set_active,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Camera '{result['name']}' added, focal_length={focal_length}mm, active={set_active}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_camera_properties(ctx: Context,
+                            name: str,
+                            location: list = None,
+                            rotation: list = None,
+                            focal_length: float = None,
+                            sensor_width: float = None,
+                            clip_start: float = None,
+                            clip_end: float = None,
+                            set_active: bool = False,
+                            user_prompt: str = "") -> str:
+    """
+    Modify an existing camera's properties.  Only pass what needs changing.
+
+    Parameters:
+    - name: camera object name
+    - location / rotation: transform
+    - focal_length: lens mm
+    - set_active: make this the render camera
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"name": name}
+        for k, v in {"location": location, "rotation": rotation,
+                     "focal_length": focal_length, "sensor_width": sensor_width,
+                     "clip_start": clip_start, "clip_end": clip_end,
+                     "set_active": set_active}.items():
+            if v is not None:
+                params[k] = v
+        result = blender.send_command("set_camera_properties", params)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Camera '{name}' updated: {json.dumps(result)}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_active_camera(ctx: Context, name: str, user_prompt: str = "") -> str:
+    """Set which camera Blender uses for rendering."""
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_active_camera", {"name": name})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Active camera set to '{name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OBJECTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def create_object(ctx: Context,
+                   primitive_type: str,
+                   name: str = None,
+                   location: list = None,
+                   rotation: list = None,
+                   scale = None,
+                   size: float = 2.0,
+                   radius: float = 1.0,
+                   depth: float = 2.0,
+                   segments: int = 32,
+                   rings: int = 16,
+                   major_radius: float = 1.0,
+                   minor_radius: float = 0.25,
+                   user_prompt: str = "") -> str:
+    """
+    Create a mesh primitive object.
+
+    primitive_type: CUBE | SPHERE | CYLINDER | PLANE | CONE | TORUS |
+                    ICOSPHERE | CIRCLE | GRID | MONKEY
+
+    Parameters:
+    - size: overall size for CUBE / PLANE / MONKEY / GRID
+    - radius: radius for SPHERE / CYLINDER / CONE / CIRCLE / ICOSPHERE
+    - depth: height for CYLINDER / CONE
+    - segments / rings: tessellation density
+    - major_radius / minor_radius: for TORUS
+    - scale: uniform float OR [sx, sy, sz] list
+    - location: [x, y, z]
+    - rotation: [rx, ry, rz] in radians
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("create_object", {
+            "primitive_type": primitive_type,
+            "name": name,
+            "location": location or [0, 0, 0],
+            "rotation": rotation or [0, 0, 0],
+            "scale": scale if scale is not None else [1, 1, 1],
+            "size": size, "radius": radius, "depth": depth,
+            "segments": segments, "rings": rings,
+            "major_radius": major_radius, "minor_radius": minor_radius,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Created '{result['name']}' ({primitive_type}) at {result['location']}, scale={result['scale']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_object_transform(ctx: Context,
+                          name: str,
+                          location: list = None,
+                          rotation: list = None,
+                          scale = None,
+                          user_prompt: str = "") -> str:
+    """
+    Set the location, rotation (Euler radians) and/or scale of an object.
+    Only pass the parameters you want to change.
+
+    Parameters:
+    - name: object name
+    - location: [x, y, z] world space
+    - rotation: [rx, ry, rz] in radians
+    - scale: uniform float OR [sx, sy, sz]
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"name": name}
+        if location is not None:
+            params["location"] = location
+        if rotation is not None:
+            params["rotation"] = rotation
+        if scale is not None:
+            params["scale"] = scale
+        result = blender.send_command("set_object_transform", params)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"'{name}' → loc={result['location']} "
+                f"rot={result['rotation_euler']} scale={result['scale']}")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def delete_object(ctx: Context, name: str, user_prompt: str = "") -> str:
+    """Delete an object from the Blender scene."""
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("delete_object", {"name": name})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Deleted object '{name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def duplicate_object(ctx: Context,
+                      name: str,
+                      new_name: str = None,
+                      location_offset: list = None,
+                      user_prompt: str = "") -> str:
+    """
+    Duplicate an object (including its mesh data).
+
+    Parameters:
+    - name: source object
+    - new_name: optional name for the copy
+    - location_offset: [dx, dy, dz] relative to the original's position
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("duplicate_object", {
+            "name": name,
+            "new_name": new_name,
+            "location_offset": location_offset or [0, 0, 0],
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Duplicated '{name}' → '{result['duplicate']}' at {result['location']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_object_visibility(ctx: Context,
+                           name: str,
+                           hide_viewport: bool = None,
+                           hide_render: bool = None,
+                           user_prompt: str = "") -> str:
+    """Show or hide an object in the viewport and/or render."""
+    try:
+        blender = get_blender_connection()
+        params = {"name": name}
+        if hide_viewport is not None:
+            params["hide_viewport"] = hide_viewport
+        if hide_render is not None:
+            params["hide_render"] = hide_render
+        result = blender.send_command("set_object_visibility", params)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"'{name}' visibility → viewport_hidden={result['hide_viewport']}, render_hidden={result['hide_render']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def parent_objects(ctx: Context,
+                    child_name: str,
+                    parent_name: str,
+                    keep_transform: bool = True,
+                    user_prompt: str = "") -> str:
+    """Parent child_name to parent_name (keep_transform preserves world position)."""
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("parent_objects", {
+            "child_name": child_name,
+            "parent_name": parent_name,
+            "keep_transform": keep_transform,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"'{child_name}' parented to '{parent_name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def join_objects(ctx: Context,
+                  object_names: list,
+                  active_name: str = None,
+                  user_prompt: str = "") -> str:
+    """
+    Join multiple mesh objects into one (equivalent to Ctrl+J in Blender).
+
+    Parameters:
+    - object_names: list of object names to join
+    - active_name: which object becomes the result (first object by default)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("join_objects", {
+            "object_names": object_names,
+            "active_name": active_name,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Joined into '{result['result_object']}' from {object_names}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def apply_transforms(ctx: Context,
+                      object_name: str,
+                      location: bool = True,
+                      rotation: bool = True,
+                      scale: bool = True,
+                      user_prompt: str = "") -> str:
+    """Apply (freeze) transforms to a mesh object.  Always apply scale before
+    using modifiers like Subdivision Surface or Solidify."""
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("apply_transforms", {
+            "object_name": object_name,
+            "location": location,
+            "rotation": rotation,
+            "scale": scale,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Transforms applied to '{object_name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_origin(ctx: Context,
+                object_name: str,
+                origin_type: str = "ORIGIN_CENTER_OF_MASS",
+                user_prompt: str = "") -> str:
+    """
+    Set the origin point of an object.
+
+    origin_type:
+    - ORIGIN_GEOMETRY: centre of bounding box
+    - ORIGIN_CENTER_OF_MASS: centre of mass (surface)
+    - ORIGIN_CENTER_OF_VOLUME: centre of mass (volume)
+    - ORIGIN_CURSOR: 3D cursor position
+    - GEOMETRY_ORIGIN: move geometry to origin, keep object location
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_origin", {
+            "object_name": object_name,
+            "origin_type": origin_type,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Origin of '{object_name}' set ({origin_type}), new loc={result.get('new_location')}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_smooth_shading(ctx: Context,
+                        object_name: str,
+                        smooth: bool = True,
+                        user_prompt: str = "") -> str:
+    """
+    Enable smooth or flat shading on a mesh object.
+    Always use smooth shading on organic/curved objects for realistic renders.
+    Use flat shading on hard-edged mechanical/architectural objects, or combine
+    with a Bevel modifier + smooth shading for best results.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_smooth_shading", {
+            "object_name": object_name,
+            "smooth": smooth,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Shading of '{object_name}' set to {'smooth' if smooth else 'flat'}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MATERIALS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def create_material(ctx: Context,
+                     name: str,
+                     base_color: list = None,
+                     metallic: float = 0.0,
+                     roughness: float = 0.5,
+                     emission_color: list = None,
+                     emission_strength: float = 0.0,
+                     alpha: float = 1.0,
+                     ior: float = 1.45,
+                     specular: float = 0.5,
+                     user_prompt: str = "") -> str:
+    """
+    Create (or replace) a PBR material using Principled BSDF.
+
+    Parameters:
+    - name: material name
+    - base_color: [r, g, b, a] 0–1 (default white)
+    - metallic: 0 = dielectric, 1 = full metal
+    - roughness: 0 = mirror, 1 = fully diffuse
+    - emission_color: [r, g, b, a] glow colour
+    - emission_strength: 0 = no glow, higher = brighter
+    - alpha: 0 = fully transparent, 1 = opaque (sets blend mode to BLEND)
+    - ior: index of refraction (glass ≈ 1.45–1.5, water ≈ 1.33)
+    - specular: specular reflection amount for dielectrics
+
+    Material recipes:
+    - Matte plastic: roughness=0.8, metallic=0, specular=0.1
+    - Polished metal: metallic=1, roughness=0.05
+    - Brushed metal: metallic=1, roughness=0.3
+    - Glass: alpha=0.0, ior=1.45, roughness=0.0
+    - Emissive light: emission_color=[1,1,1,1], emission_strength=5
+    - Rubber: roughness=0.9, specular=0.02
+    - Ceramic: roughness=0.2, metallic=0, specular=0.4
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("create_material", {
+            "name": name,
+            "base_color": base_color or [0.8, 0.8, 0.8, 1.0],
+            "metallic": metallic, "roughness": roughness,
+            "emission_color": emission_color or [0.0, 0.0, 0.0, 1.0],
+            "emission_strength": emission_strength,
+            "alpha": alpha, "ior": ior, "specular": specular,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Material '{result['name']}' created: "
+                f"color={result['base_color']}, metallic={metallic}, roughness={roughness}")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def assign_material(ctx: Context,
+                     object_name: str,
+                     material_name: str,
+                     slot_index: int = 0,
+                     user_prompt: str = "") -> str:
+    """
+    Assign an existing material to an object's material slot.
+
+    Parameters:
+    - object_name: target object
+    - material_name: material that must already exist (create it first)
+    - slot_index: 0 = first/only slot
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("assign_material", {
+            "object_name": object_name,
+            "material_name": material_name,
+            "slot_index": slot_index,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Material '{material_name}' assigned to '{object_name}' (slot {slot_index})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_material_info(ctx: Context, material_name: str, user_prompt: str = "") -> str:
+    """
+    Return the full node tree, input values and links of a material.
+    Use this to inspect what a material looks like before modifying it.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_material_info", {"material_name": material_name})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def modify_material(ctx: Context,
+                     material_name: str,
+                     base_color: list = None,
+                     metallic: float = None,
+                     roughness: float = None,
+                     emission_color: list = None,
+                     emission_strength: float = None,
+                     alpha: float = None,
+                     ior: float = None,
+                     user_prompt: str = "") -> str:
+    """
+    Update Principled BSDF values of an existing material.
+    Only pass the parameters you want to change.
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"material_name": material_name}
+        for k, v in {"base_color": base_color, "metallic": metallic,
+                     "roughness": roughness, "emission_color": emission_color,
+                     "emission_strength": emission_strength, "alpha": alpha,
+                     "ior": ior}.items():
+            if v is not None:
+                params[k] = v
+        result = blender.send_command("modify_material", params)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Material '{material_name}' updated"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODIFIERS & UV
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def add_modifier(ctx: Context,
+                  object_name: str,
+                  modifier_type: str,
+                  name: str = None,
+                  user_prompt: str = "",
+                  **params) -> str:
+    """
+    Add a modifier to an object.  Extra keyword arguments are set as modifier
+    properties.
+
+    Common modifier types and their key params:
+    - SUBSURF: levels=2, render_levels=3, subdivision_type='CATMULL_CLARK'
+    - SOLIDIFY: thickness=0.02, offset=-1
+    - BEVEL: width=0.05, segments=3, limit_method='ANGLE'
+    - BOOLEAN: operation='DIFFERENCE'|'UNION'|'INTERSECT', object=<target obj name>
+    - MIRROR: use_axis=(True,False,False), merge_threshold=0.001
+    - ARRAY: count=3, use_relative_offset=True, relative_offset_displace=(1,0,0)
+    - DECIMATE: ratio=0.5
+    - REMESH: mode='VOXEL', voxel_size=0.05
+    - SHRINKWRAP: target=<obj name>, wrap_method='NEAREST_SURFACEPOINT'
+    - DISPLACE: strength=0.5
+    - WELD: merge_threshold=0.001
+    - SMOOTH: factor=0.5, iterations=5
+    - TRIANGULATE: quad_method='BEAUTY'
+
+    Always apply scale (apply_transforms) before adding SUBSURF or SOLIDIFY.
+    """
+    try:
+        blender = get_blender_connection()
+        payload = {"object_name": object_name, "modifier_type": modifier_type}
+        if name:
+            payload["name"] = name
+        payload.update(params)
+        result = blender.send_command("add_modifier", payload)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Modifier '{result['modifier']}' ({modifier_type}) added to '{object_name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def apply_modifier(ctx: Context,
+                    object_name: str,
+                    modifier_name: str,
+                    user_prompt: str = "") -> str:
+    """Permanently apply (bake) a modifier to an object's mesh data."""
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("apply_modifier", {
+            "object_name": object_name,
+            "modifier_name": modifier_name,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Modifier '{modifier_name}' applied to '{object_name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def uv_unwrap(ctx: Context,
+               object_name: str,
+               method: str = "SMART_PROJECT",
+               island_margin: float = 0.02,
+               angle_limit: float = 66.0,
+               user_prompt: str = "") -> str:
+    """
+    UV-unwrap a mesh object.
+
+    method:
+    - SMART_PROJECT: best all-round, respects sharp edges
+    - UNWRAP: angle-based, good for organic shapes
+    - CUBE_PROJECT: quick for box-shaped objects
+    - CYLINDER_PROJECT: for cylinders/tubes
+    - SPHERE_PROJECT: for spheres
+
+    Always UV-unwrap before applying image textures!
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("uv_unwrap", {
+            "object_name": object_name,
+            "method": method,
+            "island_margin": island_margin,
+            "angle_limit": angle_limit,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"UV-unwrapped '{object_name}' ({method}), layers: {result.get('uv_layers')}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORLD / ENVIRONMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def set_world_environment(ctx: Context,
+                           bg_color: list = None,
+                           strength: float = 1.0,
+                           hdri_path: str = None,
+                           user_prompt: str = "") -> str:
+    """
+    Set the world background to a solid colour or an HDRI image.
+
+    Parameters:
+    - bg_color: [r, g, b, a] 0–1 solid background (used if no hdri_path)
+    - strength: background brightness multiplier
+    - hdri_path: absolute path to an .hdr or .exr file for image-based lighting
+
+    Tips:
+    - HDRIs provide realistic ambient lighting and reflections simultaneously.
+    - For pure studio renders use a dark solid colour + manual lights.
+    - strength > 1.0 brightens the HDRI contribution.
+    - PolyHaven (download_polyhaven_asset with type='hdris') is the best free
+      source for HDRIs.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_world_environment", {
+            "bg_color": bg_color or [0.05, 0.05, 0.05, 1.0],
+            "strength": strength,
+            "hdri_path": hdri_path,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        if result.get("type") == "hdri":
+            return f"World set to HDRI: {hdri_path} (strength={strength})"
+        return f"World background color={bg_color}, strength={strength}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIEWPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def set_viewport_shading(ctx: Context,
+                          shading_type: str = "MATERIAL",
+                          user_prompt: str = "") -> str:
+    """
+    Set the 3D viewport shading mode.
+
+    shading_type:
+    - WIREFRAME: see mesh topology
+    - SOLID: fast clay render
+    - MATERIAL: preview materials without full render
+    - RENDERED: live Cycles/EEVEE render in viewport
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_viewport_shading", {"shading_type": shading_type})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Viewport shading set to {shading_type}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REFERENCE IMAGE (MCP-side, no Blender needed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def load_reference_image(ctx: Context, image_path: str, user_prompt: str = "") -> Image:
+    """
+    Load any image from disk and return it so Claude can SEE it.
+
+    Use this to:
+    1. Analyse a reference photo before reconstructing it as a 3D scene
+    2. Compare a reference with a rendered result (call render_and_view too)
+    3. Inspect a texture before applying it
+
+    Parameters:
+    - image_path: absolute path to the image (.jpg, .png, .hdr, .exr, etc.)
+
+    Workflow for image→scene reconstruction:
+    1. load_reference_image() → study it carefully
+    2. Plan: identify objects, their shapes, materials, lighting direction,
+       camera angle and approximate focal length
+    3. Rebuild step-by-step: environment → key objects → materials → lighting
+       → camera → verify with render_and_view() → adjust → repeat
+    """
+    if not os.path.exists(image_path):
+        raise Exception(f"Image not found: {image_path}")
+    with open(image_path, "rb") as f:
+        data = f.read()
+    ext = os.path.splitext(image_path)[1].lower()
+    fmt = "jpeg" if ext in (".jpg", ".jpeg") else "png"
+    return Image(data=data, format=fmt)
+
+
 @mcp.prompt()
 def asset_creation_strategy() -> str:
-    """Defines the preferred strategy for creating assets in Blender"""
-    return """When creating 3D content in Blender, always start by checking if integrations are available:
+    """Master guide for creating any 3D content in Blender via MCP."""
+    return """
+# Blender MCP — Professional Creation Strategy
 
-    0. Before anything, always check the scene from get_scene_info()
-    
-    **IMPORTANT: Visual Verification**
-    - Use get_viewport_screenshot() BEFORE making changes to see the current state
-    - Use get_viewport_screenshot() AFTER executing code or importing assets to verify the result
-    - This helps confirm your changes worked as expected and catch any visual issues
-    1. First use the following tools to verify if the following integrations are enabled:
-        1. PolyHaven
-            Use get_polyhaven_status() to verify its status
-            If PolyHaven is enabled:
-            - For objects/models: Use download_polyhaven_asset() with asset_type="models"
-            - For materials/textures: Use download_polyhaven_asset() with asset_type="textures"
-            - For environment lighting: Use download_polyhaven_asset() with asset_type="hdris"
-        2. Sketchfab
-            Sketchfab is good at Realistic models, and has a wider variety of models than PolyHaven.
-            Use get_sketchfab_status() to verify its status
-            If Sketchfab is enabled:
-            - For objects/models: First search using search_sketchfab_models() with your query
-            - Then download specific models using download_sketchfab_model() with the UID
-            - Note that only downloadable models can be accessed, and API key must be properly configured
-            - Sketchfab has a wider variety of models than PolyHaven, especially for specific subjects
-        3. Hyper3D(Rodin)
-            Hyper3D Rodin is good at generating 3D models for single item.
-            So don't try to:
-            1. Generate the whole scene with one shot
-            2. Generate ground using Hyper3D
-            3. Generate parts of the items separately and put them together afterwards
+## 0. ALWAYS start here
+1. get_full_scene_info()    → understand everything currently in the scene
+2. get_scene_statistics()   → check poly count / memory budget
+3. get_viewport_screenshot() OR render_and_view() → see the current visual state
 
-            Use get_hyper3d_status() to verify its status
-            If Hyper3D is enabled:
-            - For objects/models, do the following steps:
-                1. Create the model generation task
-                    - Use generate_hyper3d_model_via_images() if image(s) is/are given
-                    - Use generate_hyper3d_model_via_text() if generating 3D asset using text prompt
-                    If key type is free_trial and insufficient balance error returned, tell the user that the free trial key can only generated limited models everyday, they can choose to:
-                    - Wait for another day and try again
-                    - Go to hyper3d.ai to find out how to get their own API key
-                    - Go to fal.ai to get their own private API key
-                2. Poll the status
-                    - Use poll_rodin_job_status() to check if the generation task has completed or failed
-                3. Import the asset
-                    - Use import_generated_asset() to import the generated GLB model the asset
-                4. After importing the asset, ALWAYS check the world_bounding_box of the imported mesh, and adjust the mesh's location and size
-                    Adjust the imported mesh's location, scale, rotation, so that the mesh is on the right spot.
+## 1. VISUAL FEEDBACK LOOP (critical)
+- Call render_and_view(engine='BLENDER_EEVEE', samples=64) frequently to see results
+- After EVERY significant change: render → observe → decide → adjust
+- Use get_viewport_screenshot() for a quick no-render check
+- Never assume a change looks right without visual confirmation
 
-                You can reuse assets previous generated by running python code to duplicate the object, without creating another generation task.
-        4. Hunyuan3D
-            Hunyuan3D is good at generating 3D models for single item.
-            So don't try to:
-            1. Generate the whole scene with one shot
-            2. Generate ground using Hunyuan3D
-            3. Generate parts of the items separately and put them together afterwards
+## 2. OBJECT SOURCING PRIORITY
+For any object needed in the scene, try in this order:
+  a) Sketchfab (get_sketchfab_status → search_sketchfab_models → download_sketchfab_model)
+     Best for: realistic named models, vehicles, characters, props
+  b) PolyHaven (get_polyhaven_status → search_polyhaven_assets → download_polyhaven_asset)
+     Best for: furniture, plants, generic props, materials, HDRIs
+  c) Hyper3D Rodin (get_hyper3d_status → generate_hyper3d_model_via_text/images → poll → import)
+     Best for: custom unique objects not in any library (one object at a time)
+  d) Hunyuan3D — similar to Hyper3D, alternative source
+  e) create_object() + modelling — for simple geometric shapes
+  f) execute_blender_code() — for custom procedural geometry
 
-            Use get_hunyuan3d_status() to verify its status
-            If Hunyuan3D is enabled:
-                if Hunyuan3D mode is "OFFICIAL_API":
-                    - For objects/models, do the following steps:
-                        1. Create the model generation task
-                            - Use generate_hunyuan3d_model by providing either a **text description** OR an **image(local or urls) reference**.
-                            - Go to cloud.tencent.com out how to get their own SecretId and SecretKey
-                        2. Poll the status
-                            - Use poll_hunyuan_job_status() to check if the generation task has completed or failed
-                        3. Import the asset
-                            - Use import_generated_asset_hunyuan() to import the generated OBJ model the asset
-                    if Hunyuan3D mode is "LOCAL_API":
-                        - For objects/models, do the following steps:
-                        1. Create the model generation task
-                            - Use generate_hunyuan3d_model if image (local or urls)  or text prompt is given and import the asset
+## 3. SCENE BUILDING ORDER (professional workflow)
+  1. Set render settings (set_render_settings: engine, resolution, samples)
+  2. Set up world / environment (set_world_environment with HDRI or colour)
+  3. Build the ground / floor (plane or imported)
+  4. Import / create main objects, one at a time
+  5. Position objects (set_object_transform), check bounding boxes
+  6. Apply materials (create_material → assign_material), UV-unwrap first if needed
+  7. Add textures from PolyHaven (download_polyhaven_asset → set_texture)
+  8. Add lighting (add_light: key + fill + rim for 3-point, or HDRI-only)
+  9. Position camera (add_camera with appropriate focal length)
+  10. Render and iterate
 
-                You can reuse assets previous generated by running python code to duplicate the object, without creating another generation task.
+## 4. MATERIALS WORKFLOW
+- create_material() for PBR materials (metallic/roughness workflow)
+- assign_material() to apply to object
+- modify_material() to tweak without recreating
+- For image textures: uv_unwrap first, then download_polyhaven_asset(type='textures') + set_texture
+- get_material_info() to inspect node tree before editing
 
-    3. Always check the world_bounding_box for each item so that:
-        - Ensure that all objects that should not be clipping are not clipping.
-        - Items have right spatial relationship.
-    
-    4. Recommended asset source priority:
-        - For specific existing objects: First try Sketchfab, then PolyHaven
-        - For generic objects/furniture: First try PolyHaven, then Sketchfab
-        - For custom or unique items not available in libraries: Use Hyper3D Rodin or Hunyuan3D
-        - For environment lighting: Use PolyHaven HDRIs
-        - For materials/textures: Use PolyHaven textures
+## 5. LIGHTING GUIDE
+- Outdoor/large scenes: set_world_environment(hdri_path=...) alone is often enough
+- Studio: 3-point setup
+    Key: add_light(AREA, location=[3,−3,4], energy=500, area_size=1)
+    Fill: add_light(POINT, location=[−3,1,2], energy=100)
+    Rim: add_light(SPOT, location=[0,4,3], rotation=[−0.5,0,3.14], energy=200)
+- Adjust energy until render looks correct (render_and_view after each change)
 
-    Only fall back to scripting when:
-    - PolyHaven, Sketchfab, Hyper3D, and Hunyuan3D are all disabled
-    - A simple primitive is explicitly requested
-    - No suitable asset exists in any of the libraries
-    - Hyper3D Rodin or Hunyuan3D failed to generate the desired asset
-    - The task specifically requires a basic material/color
+## 6. MODIFIER WORKFLOW
+Always in this order:
+  1. Create base mesh
+  2. apply_transforms(scale=True)  ← critical before SubSurf/Solidify
+  3. add_modifier(SUBSURF, levels=2)
+  4. set_smooth_shading(smooth=True)
 
-    **Best Practices:**
-    - Always take a screenshot after completing a task to verify the visual result
-    - Always call get_scene_info() after completing a task to verify the changes worked
-    - When executing multiple operations, take intermediate screenshots to confirm each step
-    - If something looks wrong in the screenshot or scene info, investigate and fix before proceeding
-    """
+## 7. AFTER EACH IMPORTED ASSET
+- Check world_bounding_box in get_full_scene_info()
+- set_object_transform() to place correctly
+- set_smooth_shading() if organic
+- apply_transforms() if scale ≠ 1
+
+## 8. CAMERA
+- Focal length guide: 24mm=wide, 50mm=natural, 85mm=portrait, 135mm=compression
+- Rotation in radians: (1.1, 0, 0.8) ≈ standard 3/4 view of origin
+- set_active_camera() after adding camera
+
+## 9. FINAL RENDER
+set_render_settings(engine='CYCLES', samples=256, resolution_x=1920, resolution_y=1080)
+render_and_view(engine='CYCLES', samples=256)
+"""
+
+
+@mcp.prompt()
+def image_to_scene() -> str:
+    """Step-by-step guide for reconstructing a 3D scene from a reference image."""
+    return """
+# Image → 3D Scene Reconstruction (Professional Workflow)
+
+## PHASE 1 — ANALYSE the reference image
+Call load_reference_image(image_path) and study it carefully:
+
+### Geometry analysis
+- What objects are in the scene?  List every distinct item.
+- What is the approximate shape of each object? (box, cylinder, sphere, organic…)
+- What is the spatial relationship between objects? (on top, beside, stacked…)
+- What is the ground/floor/background?
+
+### Lighting analysis
+- Where is the main light source? (direction of hard shadows)
+- Is the lighting soft (overcast) or hard (direct sun/spot)?
+- Are there multiple light sources? Rim lighting? Coloured lights?
+- Is there ambient light (HDRI / sky) or a controlled studio environment?
+- Estimate light positions from highlight and shadow positions on objects
+
+### Camera analysis
+- Is the camera low, mid, or high angle?
+- Wide angle (< 35mm) or telephoto (> 85mm)?  Check for perspective distortion.
+- Is there depth of field (background blur)?
+- What is the approximate camera height?
+
+### Material analysis
+For each object, note:
+- Is it matte or shiny? (roughness estimate: matte ≈ 0.8, semi-gloss ≈ 0.4, mirror ≈ 0.05)
+- Is it metallic or dielectric?
+- What is the base colour?
+- Are there visible textures? (wood grain, fabric weave, concrete, etc.)
+- Transparency / translucency?
+
+## PHASE 2 — PLAN before building
+Write out (to the user or internally) your reconstruction plan:
+  - List of objects to create/import
+  - Material plan for each object
+  - Lighting setup
+  - Camera position and focal length estimate
+
+## PHASE 3 — BUILD the scene step by step
+
+### Step 1: Setup
+```
+set_render_settings(engine='BLENDER_EEVEE', resolution_x=1920, resolution_y=1080, samples=64)
+```
+Clear any existing objects that don't belong.
+
+### Step 2: Environment
+```
+set_world_environment(bg_color=[r,g,b,1.0], strength=1.0)
+# OR if outdoor/HDRI scene:
+# download_polyhaven_asset(asset_id='..', asset_type='hdris', resolution='2k')
+```
+
+### Step 3: Ground / floor
+```
+create_object('PLANE', name='Floor', scale=[5,5,1])
+create_material('floor_mat', base_color=[r,g,b,1], roughness=0.8)
+assign_material('Floor', 'floor_mat')
+```
+
+### Step 4: Main objects (one at a time)
+For each object in the scene:
+  a) Source it (Sketchfab → PolyHaven → Hyper3D → primitive)
+  b) Position it with set_object_transform()
+  c) Verify position: get_full_scene_info() → check world_bounding_box
+  d) Material: create_material() → assign_material()
+  e) Quick render to check
+
+### Step 5: Lighting
+Add lights based on your analysis.  Start with the key light, render, then add fill.
+```
+add_light('AREA', name='Key', location=[3,-2,4], rotation=[-0.7,0,0.5], energy=400, area_size=1.5)
+render_and_view()   # check shadows
+add_light('POINT', name='Fill', location=[-2,1,2], energy=80)
+render_and_view()   # check fill
+```
+
+### Step 6: Camera
+```
+add_camera(name='MainCamera', location=[x,y,z], rotation=[rx,ry,rz], focal_length=50)
+set_active_camera('MainCamera')
+render_and_view()   # compare composition with reference
+```
+
+## PHASE 4 — COMPARE & ITERATE
+1. render_and_view(engine='BLENDER_EEVEE', samples=128)
+2. load_reference_image(image_path)  ← view original again
+3. Identify differences: wrong object, wrong material, wrong light, wrong camera angle
+4. Fix one thing at a time and re-render after each fix
+5. Repeat until the render closely matches the reference
+
+## PHASE 5 — FINAL QUALITY RENDER
+```
+set_render_settings(engine='CYCLES', samples=512, use_denoising=True)
+render_and_view(engine='CYCLES', samples=512, resolution_x=1920, resolution_y=1080)
+```
+
+## RULES for faithful reconstruction
+- NEVER skip the analysis phase — rushing leads to completely wrong scenes
+- ALWAYS verify with render after placing each major object
+- Match lighting direction precisely — wrong shadows destroy realism
+- Match camera angle first before worrying about materials
+- Build large-to-small: background → ground → large objects → props → details
+- Use PolyHaven textures for photo-realistic surfaces (wood, concrete, fabric, etc.)
+- Use smooth shading on all rounded/organic objects
+"""
 
 # Main execution
 

@@ -274,6 +274,7 @@ class BlenderMCPServer:
 
         # Base handlers that are always available
         handlers = {
+            # Legacy / core
             "get_scene_info": self.get_scene_info,
             "get_object_info": self.get_object_info,
             "get_viewport_screenshot": self.get_viewport_screenshot,
@@ -283,6 +284,44 @@ class BlenderMCPServer:
             "get_hyper3d_status": self.get_hyper3d_status,
             "get_sketchfab_status": self.get_sketchfab_status,
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
+            # Scene awareness
+            "get_full_scene_info": self.get_full_scene_info,
+            "get_scene_statistics": self.get_scene_statistics,
+            # Render
+            "render_frame": self.render_frame,
+            "get_render_settings": self.get_render_settings,
+            "set_render_settings": self.set_render_settings,
+            # Lights
+            "add_light": self.add_light,
+            "modify_light": self.modify_light,
+            # Cameras
+            "add_camera": self.add_camera,
+            "set_camera_properties": self.set_camera_properties,
+            "set_active_camera": self.set_active_camera,
+            # Objects
+            "create_object": self.create_object,
+            "set_object_transform": self.set_object_transform,
+            "delete_object": self.delete_object,
+            "duplicate_object": self.duplicate_object,
+            "set_object_visibility": self.set_object_visibility,
+            "parent_objects": self.parent_objects,
+            "join_objects": self.join_objects,
+            "apply_transforms": self.apply_transforms,
+            "set_origin": self.set_origin,
+            "set_smooth_shading": self.set_smooth_shading,
+            # Materials
+            "create_material": self.create_material,
+            "assign_material": self.assign_material,
+            "get_material_info": self.get_material_info,
+            "modify_material": self.modify_material,
+            # Modifiers & UV
+            "add_modifier": self.add_modifier,
+            "apply_modifier": self.apply_modifier,
+            "uv_unwrap": self.uv_unwrap,
+            # World / Environment
+            "set_world_environment": self.set_world_environment,
+            # Viewport
+            "set_viewport_shading": self.set_viewport_shading,
         }
 
         # Add Polyhaven handlers only if enabled
@@ -506,6 +545,1041 @@ class BlenderMCPServer:
             raise Exception(f"Code execution error: {str(e)}")
 
 
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SCENE AWARENESS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_full_scene_info(self):
+        """Return a complete snapshot of the scene: every object, light, camera,
+        material, world and render settings — no truncation."""
+        try:
+            scene = bpy.context.scene
+            info = {
+                "scene_name": scene.name,
+                "frame_current": scene.frame_current,
+                "frame_range": [scene.frame_start, scene.frame_end],
+                "active_camera": scene.camera.name if scene.camera else None,
+                "objects": [],
+                "materials": [],
+                "world": None,
+                "render": {},
+            }
+
+            for obj in scene.objects:
+                od = {
+                    "name": obj.name,
+                    "type": obj.type,
+                    "location": [round(v, 4) for v in obj.location],
+                    "rotation_euler": [round(v, 4) for v in obj.rotation_euler],
+                    "scale": [round(v, 4) for v in obj.scale],
+                    "visible_viewport": obj.visible_get(),
+                    "hide_render": obj.hide_render,
+                    "parent": obj.parent.name if obj.parent else None,
+                    "materials": [s.material.name for s in obj.material_slots if s.material],
+                    "modifiers": [{"name": m.name, "type": m.type} for m in obj.modifiers],
+                    "constraints": [{"name": c.name, "type": c.type} for c in obj.constraints],
+                }
+                if obj.type == 'MESH' and obj.data:
+                    od["vertex_count"] = len(obj.data.vertices)
+                    od["poly_count"] = len(obj.data.polygons)
+                    od["uv_layers"] = [u.name for u in obj.data.uv_layers]
+                    try:
+                        od["world_bounding_box"] = self._get_aabb(obj)
+                    except Exception:
+                        pass
+                elif obj.type == 'LIGHT' and obj.data:
+                    lt = obj.data
+                    ld = {
+                        "type": lt.type,
+                        "energy": round(lt.energy, 3),
+                        "color": [round(c, 3) for c in lt.color],
+                    }
+                    if hasattr(lt, 'shadow_soft_size'):
+                        ld["radius"] = round(lt.shadow_soft_size, 4)
+                    if lt.type == 'SPOT':
+                        ld["spot_size"] = round(lt.spot_size, 4)
+                        ld["spot_blend"] = round(lt.spot_blend, 4)
+                    if lt.type == 'AREA':
+                        ld["size"] = round(lt.size, 4)
+                        ld["shape"] = lt.shape
+                    if lt.type == 'SUN':
+                        ld["angle"] = round(lt.angle, 4)
+                    od["light"] = ld
+                elif obj.type == 'CAMERA' and obj.data:
+                    cam = obj.data
+                    od["camera"] = {
+                        "focal_length_mm": round(cam.lens, 3),
+                        "sensor_width_mm": round(cam.sensor_width, 3),
+                        "clip_start": round(cam.clip_start, 4),
+                        "clip_end": round(cam.clip_end, 3),
+                        "is_active": (scene.camera == obj),
+                    }
+                    if hasattr(cam, 'dof') and hasattr(cam.dof, 'use_dof'):
+                        od["camera"]["dof_enabled"] = cam.dof.use_dof
+                info["objects"].append(od)
+
+            # Materials
+            for mat in bpy.data.materials:
+                md = {
+                    "name": mat.name,
+                    "users": mat.users,
+                    "use_nodes": mat.use_nodes,
+                    "blend_method": getattr(mat, 'blend_method', 'OPAQUE'),
+                }
+                if mat.use_nodes and mat.node_tree:
+                    for node in mat.node_tree.nodes:
+                        if node.type == 'BSDF_PRINCIPLED':
+                            try:
+                                md["base_color"] = [round(v, 3) for v in node.inputs["Base Color"].default_value]
+                                md["metallic"] = round(node.inputs["Metallic"].default_value, 3)
+                                md["roughness"] = round(node.inputs["Roughness"].default_value, 3)
+                                for em_key in ("Emission Strength", "Emission"):
+                                    if em_key in node.inputs:
+                                        val = node.inputs[em_key].default_value
+                                        if isinstance(val, float):
+                                            md["emission_strength"] = round(val, 3)
+                                        break
+                            except Exception:
+                                pass
+                            break
+                    md["texture_count"] = sum(1 for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE')
+                info["materials"].append(md)
+
+            # World
+            world = scene.world
+            if world:
+                wd = {"name": world.name, "use_nodes": world.use_nodes}
+                if world.use_nodes and world.node_tree:
+                    for node in world.node_tree.nodes:
+                        if node.type == 'BACKGROUND':
+                            wd["bg_strength"] = round(node.inputs["Strength"].default_value, 3)
+                            if not node.inputs["Color"].is_linked:
+                                wd["bg_color"] = [round(v, 3) for v in node.inputs["Color"].default_value]
+                        if node.type == 'TEX_ENVIRONMENT' and node.image:
+                            wd["hdri"] = node.image.filepath or node.image.name
+                info["world"] = wd
+
+            # Render
+            r = scene.render
+            rd = {
+                "engine": r.engine,
+                "resolution": [r.resolution_x, r.resolution_y],
+                "resolution_percentage": r.resolution_percentage,
+                "film_transparent": r.film_transparent,
+            }
+            if r.engine == 'CYCLES' and hasattr(scene, 'cycles'):
+                rd["cycles_samples"] = scene.cycles.samples
+                rd["cycles_device"] = scene.cycles.device
+                rd["cycles_denoising"] = scene.cycles.use_denoising
+            elif r.engine in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT') and hasattr(scene, 'eevee'):
+                rd["eevee_samples"] = scene.eevee.taa_render_samples
+            info["render"] = rd
+
+            return info
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def get_scene_statistics(self):
+        """Return polygon / vertex / light / object counts for the scene."""
+        try:
+            scene = bpy.context.scene
+            meshes = lights = cameras = curves = empties = 0
+            total_verts = total_tris = 0
+            for obj in scene.objects:
+                if obj.type == 'MESH' and obj.data:
+                    meshes += 1
+                    total_verts += len(obj.data.vertices)
+                    for poly in obj.data.polygons:
+                        total_tris += max(len(poly.vertices) - 2, 1)
+                elif obj.type == 'LIGHT':
+                    lights += 1
+                elif obj.type == 'CAMERA':
+                    cameras += 1
+                elif obj.type == 'CURVE':
+                    curves += 1
+                elif obj.type == 'EMPTY':
+                    empties += 1
+            return {
+                "total_objects": len(scene.objects),
+                "mesh_objects": meshes,
+                "light_objects": lights,
+                "camera_objects": cameras,
+                "curve_objects": curves,
+                "empty_objects": empties,
+                "total_vertices": total_verts,
+                "total_tris_approx": total_tris,
+                "total_materials": len(bpy.data.materials),
+                "total_images": len(bpy.data.images),
+                "total_textures": len(bpy.data.textures),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # RENDER
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def render_frame(self, output_path, engine='BLENDER_EEVEE', samples=64,
+                     resolution_x=None, resolution_y=None):
+        """Render the current frame to *output_path* (PNG) and return the path."""
+        try:
+            scene = bpy.context.scene
+            orig = {
+                'engine': scene.render.engine,
+                'filepath': scene.render.filepath,
+                'fmt': scene.render.image_settings.file_format,
+                'res_x': scene.render.resolution_x,
+                'res_y': scene.render.resolution_y,
+            }
+            if engine == 'CYCLES' and hasattr(scene, 'cycles'):
+                orig['cycles_samples'] = scene.cycles.samples
+            if hasattr(scene, 'eevee'):
+                orig['eevee_samples'] = scene.eevee.taa_render_samples
+
+            scene.render.engine = engine
+            scene.render.filepath = output_path
+            scene.render.image_settings.file_format = 'PNG'
+            if resolution_x:
+                scene.render.resolution_x = int(resolution_x)
+            if resolution_y:
+                scene.render.resolution_y = int(resolution_y)
+            if engine == 'CYCLES' and hasattr(scene, 'cycles'):
+                scene.cycles.samples = int(samples)
+            elif engine in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT') and hasattr(scene, 'eevee'):
+                scene.eevee.taa_render_samples = int(samples)
+
+            bpy.ops.render.render(write_still=True)
+
+            # Restore
+            scene.render.engine = orig['engine']
+            scene.render.filepath = orig['filepath']
+            scene.render.image_settings.file_format = orig['fmt']
+            scene.render.resolution_x = orig['res_x']
+            scene.render.resolution_y = orig['res_y']
+            if 'cycles_samples' in orig and hasattr(scene, 'cycles'):
+                scene.cycles.samples = orig['cycles_samples']
+            if 'eevee_samples' in orig and hasattr(scene, 'eevee'):
+                scene.eevee.taa_render_samples = orig['eevee_samples']
+
+            return {
+                "success": True,
+                "output_path": output_path,
+                "engine": engine,
+                "samples": samples,
+                "resolution": [scene.render.resolution_x, scene.render.resolution_y],
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def get_render_settings(self):
+        """Return current render configuration."""
+        try:
+            scene = bpy.context.scene
+            r = scene.render
+            result = {
+                "engine": r.engine,
+                "resolution_x": r.resolution_x,
+                "resolution_y": r.resolution_y,
+                "resolution_percentage": r.resolution_percentage,
+                "filepath": r.filepath,
+                "file_format": r.image_settings.file_format,
+                "film_transparent": r.film_transparent,
+            }
+            if r.engine == 'CYCLES' and hasattr(scene, 'cycles'):
+                result["cycles"] = {
+                    "samples": scene.cycles.samples,
+                    "device": scene.cycles.device,
+                    "use_denoising": scene.cycles.use_denoising,
+                    "max_bounces": scene.cycles.max_bounces,
+                }
+            if r.engine in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT') and hasattr(scene, 'eevee'):
+                result["eevee"] = {
+                    "taa_render_samples": scene.eevee.taa_render_samples,
+                    "use_bloom": getattr(scene.eevee, 'use_bloom', False),
+                    "use_ssr": getattr(scene.eevee, 'use_ssr', False),
+                    "use_gtao": getattr(scene.eevee, 'use_gtao', False),
+                }
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def set_render_settings(self, engine=None, resolution_x=None, resolution_y=None,
+                             resolution_percentage=None, samples=None,
+                             film_transparent=None, output_path=None,
+                             file_format=None, use_denoising=None):
+        """Configure render settings."""
+        try:
+            scene = bpy.context.scene
+            r = scene.render
+            if engine:
+                r.engine = engine
+            if resolution_x:
+                r.resolution_x = int(resolution_x)
+            if resolution_y:
+                r.resolution_y = int(resolution_y)
+            if resolution_percentage:
+                r.resolution_percentage = int(resolution_percentage)
+            if film_transparent is not None:
+                r.film_transparent = bool(film_transparent)
+            if output_path:
+                r.filepath = output_path
+            if file_format:
+                r.image_settings.file_format = file_format
+            if samples is not None:
+                if r.engine == 'CYCLES' and hasattr(scene, 'cycles'):
+                    scene.cycles.samples = int(samples)
+                elif r.engine in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT') and hasattr(scene, 'eevee'):
+                    scene.eevee.taa_render_samples = int(samples)
+            if use_denoising is not None and hasattr(scene, 'cycles'):
+                scene.cycles.use_denoising = bool(use_denoising)
+            return {
+                "success": True,
+                "engine": r.engine,
+                "resolution": [r.resolution_x, r.resolution_y],
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # LIGHTS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def add_light(self, light_type='POINT', name=None, location=(0, 0, 5),
+                  rotation=(0, 0, 0), energy=1000.0, color=(1.0, 1.0, 1.0),
+                  radius=0.25, spot_size=0.785398, spot_blend=0.15,
+                  area_size=1.0, area_shape='SQUARE', sun_angle=0.00918):
+        """Add a light (POINT / SUN / SPOT / AREA) to the scene."""
+        try:
+            VALID = {'POINT', 'SUN', 'SPOT', 'AREA'}
+            lt = light_type.upper()
+            if lt not in VALID:
+                return {"error": f"light_type must be one of {VALID}"}
+            if not name:
+                name = f"{lt.capitalize()}_Light"
+            ld = bpy.data.lights.new(name=name, type=lt)
+            ld.energy = float(energy)
+            ld.color = (float(color[0]), float(color[1]), float(color[2]))
+            if lt == 'POINT' and hasattr(ld, 'shadow_soft_size'):
+                ld.shadow_soft_size = float(radius)
+            elif lt == 'SPOT':
+                ld.spot_size = float(spot_size)
+                ld.spot_blend = float(spot_blend)
+                if hasattr(ld, 'shadow_soft_size'):
+                    ld.shadow_soft_size = float(radius)
+            elif lt == 'AREA':
+                ld.size = float(area_size)
+                ld.shape = area_shape
+            elif lt == 'SUN':
+                ld.angle = float(sun_angle)
+            obj = bpy.data.objects.new(name=name, object_data=ld)
+            bpy.context.collection.objects.link(obj)
+            obj.location = (float(location[0]), float(location[1]), float(location[2]))
+            obj.rotation_euler = (float(rotation[0]), float(rotation[1]), float(rotation[2]))
+            return {
+                "success": True,
+                "name": obj.name,
+                "type": lt,
+                "location": list(obj.location),
+                "energy": energy,
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def modify_light(self, name, energy=None, color=None, radius=None,
+                     spot_size=None, spot_blend=None, area_size=None,
+                     location=None, rotation=None):
+        """Modify properties of an existing light object."""
+        try:
+            obj = bpy.data.objects.get(name)
+            if not obj or obj.type != 'LIGHT':
+                return {"error": f"Light '{name}' not found"}
+            lt = obj.data
+            if energy is not None:
+                lt.energy = float(energy)
+            if color is not None:
+                lt.color = (float(color[0]), float(color[1]), float(color[2]))
+            if radius is not None and hasattr(lt, 'shadow_soft_size'):
+                lt.shadow_soft_size = float(radius)
+            if spot_size is not None:
+                lt.spot_size = float(spot_size)
+            if spot_blend is not None:
+                lt.spot_blend = float(spot_blend)
+            if area_size is not None:
+                lt.size = float(area_size)
+            if location is not None:
+                obj.location = (float(location[0]), float(location[1]), float(location[2]))
+            if rotation is not None:
+                obj.rotation_euler = (float(rotation[0]), float(rotation[1]), float(rotation[2]))
+            return {
+                "success": True,
+                "name": obj.name,
+                "type": lt.type,
+                "energy": lt.energy,
+                "color": list(lt.color),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # CAMERAS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def add_camera(self, name='Camera', location=(7.36, -6.93, 4.96),
+                   rotation=(1.1093, 0.0, 0.8149), focal_length=50.0,
+                   sensor_width=36.0, clip_start=0.1, clip_end=1000.0,
+                   set_active=True):
+        """Add a camera to the scene."""
+        try:
+            cd = bpy.data.cameras.new(name=name)
+            cd.lens = float(focal_length)
+            cd.sensor_width = float(sensor_width)
+            cd.clip_start = float(clip_start)
+            cd.clip_end = float(clip_end)
+            obj = bpy.data.objects.new(name=name, object_data=cd)
+            bpy.context.collection.objects.link(obj)
+            obj.location = (float(location[0]), float(location[1]), float(location[2]))
+            obj.rotation_euler = (float(rotation[0]), float(rotation[1]), float(rotation[2]))
+            if set_active:
+                bpy.context.scene.camera = obj
+            return {
+                "success": True,
+                "name": obj.name,
+                "location": list(obj.location),
+                "focal_length": focal_length,
+                "is_active": bool(set_active),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def set_camera_properties(self, name, location=None, rotation=None,
+                               focal_length=None, sensor_width=None,
+                               clip_start=None, clip_end=None,
+                               set_active=False):
+        """Modify an existing camera's properties."""
+        try:
+            obj = bpy.data.objects.get(name)
+            if not obj or obj.type != 'CAMERA':
+                return {"error": f"Camera '{name}' not found"}
+            cam = obj.data
+            if location is not None:
+                obj.location = (float(location[0]), float(location[1]), float(location[2]))
+            if rotation is not None:
+                obj.rotation_euler = (float(rotation[0]), float(rotation[1]), float(rotation[2]))
+            if focal_length is not None:
+                cam.lens = float(focal_length)
+            if sensor_width is not None:
+                cam.sensor_width = float(sensor_width)
+            if clip_start is not None:
+                cam.clip_start = float(clip_start)
+            if clip_end is not None:
+                cam.clip_end = float(clip_end)
+            if set_active:
+                bpy.context.scene.camera = obj
+            return {
+                "success": True,
+                "name": obj.name,
+                "location": [round(v, 4) for v in obj.location],
+                "rotation_euler": [round(v, 4) for v in obj.rotation_euler],
+                "focal_length": cam.lens,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def set_active_camera(self, name):
+        """Set the scene's active/render camera."""
+        try:
+            obj = bpy.data.objects.get(name)
+            if not obj or obj.type != 'CAMERA':
+                return {"error": f"Camera '{name}' not found"}
+            bpy.context.scene.camera = obj
+            return {"success": True, "active_camera": name}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # OBJECTS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def create_object(self, primitive_type, name=None, location=(0, 0, 0),
+                      rotation=(0, 0, 0), scale=(1, 1, 1),
+                      size=2.0, radius=1.0, depth=2.0,
+                      segments=32, rings=16,
+                      major_radius=1.0, minor_radius=0.25):
+        """Create a mesh primitive (CUBE / SPHERE / CYLINDER / PLANE / CONE /
+        TORUS / ICOSPHERE / CIRCLE / GRID / MONKEY)."""
+        try:
+            loc = (float(location[0]), float(location[1]), float(location[2]))
+            rot = (float(rotation[0]), float(rotation[1]), float(rotation[2]))
+            pt = primitive_type.upper()
+            VALID = {'CUBE', 'SPHERE', 'CYLINDER', 'PLANE', 'CONE',
+                     'TORUS', 'ICOSPHERE', 'CIRCLE', 'GRID', 'MONKEY'}
+            if pt not in VALID:
+                return {"error": f"Unknown primitive '{primitive_type}'. Valid: {VALID}"}
+
+            if pt == 'CUBE':
+                bpy.ops.mesh.primitive_cube_add(size=float(size), location=loc, rotation=rot)
+            elif pt == 'SPHERE':
+                bpy.ops.mesh.primitive_uv_sphere_add(
+                    radius=float(radius), segments=int(segments),
+                    ring_count=int(rings), location=loc, rotation=rot)
+            elif pt == 'CYLINDER':
+                bpy.ops.mesh.primitive_cylinder_add(
+                    radius=float(radius), depth=float(depth),
+                    vertices=int(segments), location=loc, rotation=rot)
+            elif pt == 'PLANE':
+                bpy.ops.mesh.primitive_plane_add(size=float(size), location=loc, rotation=rot)
+            elif pt == 'CONE':
+                bpy.ops.mesh.primitive_cone_add(
+                    radius1=float(radius), radius2=0.0,
+                    depth=float(depth), vertices=int(segments),
+                    location=loc, rotation=rot)
+            elif pt == 'TORUS':
+                bpy.ops.mesh.primitive_torus_add(
+                    major_radius=float(major_radius), minor_radius=float(minor_radius),
+                    major_segments=int(segments), minor_segments=int(rings),
+                    location=loc, rotation=rot)
+            elif pt == 'ICOSPHERE':
+                bpy.ops.mesh.primitive_ico_sphere_add(
+                    radius=float(radius), subdivisions=int(min(rings, 8)),
+                    location=loc, rotation=rot)
+            elif pt == 'CIRCLE':
+                bpy.ops.mesh.primitive_circle_add(
+                    radius=float(radius), vertices=int(segments),
+                    location=loc, rotation=rot)
+            elif pt == 'GRID':
+                bpy.ops.mesh.primitive_grid_add(
+                    size=float(size), x_subdivisions=int(segments),
+                    y_subdivisions=int(segments), location=loc, rotation=rot)
+            elif pt == 'MONKEY':
+                bpy.ops.mesh.primitive_monkey_add(size=float(size), location=loc, rotation=rot)
+
+            obj = bpy.context.active_object
+            if name:
+                obj.name = name
+                if obj.data:
+                    obj.data.name = name
+            sc = scale if not isinstance(scale, (int, float)) else (float(scale),) * 3
+            obj.scale = (float(sc[0]), float(sc[1]), float(sc[2]))
+            bpy.context.view_layer.update()
+            return {
+                "success": True,
+                "name": obj.name,
+                "type": pt,
+                "location": list(obj.location),
+                "scale": list(obj.scale),
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def set_object_transform(self, name, location=None, rotation=None, scale=None):
+        """Set location / rotation_euler / scale of an object (pass only what to change)."""
+        try:
+            obj = bpy.data.objects.get(name)
+            if not obj:
+                return {"error": f"Object '{name}' not found"}
+            if location is not None:
+                obj.location = (float(location[0]), float(location[1]), float(location[2]))
+            if rotation is not None:
+                obj.rotation_euler = (float(rotation[0]), float(rotation[1]), float(rotation[2]))
+            if scale is not None:
+                if isinstance(scale, (int, float)):
+                    obj.scale = (float(scale),) * 3
+                else:
+                    obj.scale = (float(scale[0]), float(scale[1]), float(scale[2]))
+            bpy.context.view_layer.update()
+            return {
+                "success": True,
+                "name": obj.name,
+                "location": [round(v, 4) for v in obj.location],
+                "rotation_euler": [round(v, 4) for v in obj.rotation_euler],
+                "scale": [round(v, 4) for v in obj.scale],
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def delete_object(self, name):
+        """Delete an object (and optionally its data) from the scene."""
+        try:
+            obj = bpy.data.objects.get(name)
+            if not obj:
+                return {"error": f"Object '{name}' not found"}
+            bpy.data.objects.remove(obj, do_unlink=True)
+            return {"success": True, "deleted": name}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def duplicate_object(self, name, new_name=None, location_offset=(0, 0, 0)):
+        """Duplicate an object including its mesh data."""
+        try:
+            obj = bpy.data.objects.get(name)
+            if not obj:
+                return {"error": f"Object '{name}' not found"}
+            new_obj = obj.copy()
+            if obj.data:
+                new_obj.data = obj.data.copy()
+            new_obj.location = (
+                obj.location.x + float(location_offset[0]),
+                obj.location.y + float(location_offset[1]),
+                obj.location.z + float(location_offset[2]),
+            )
+            if new_name:
+                new_obj.name = new_name
+            bpy.context.collection.objects.link(new_obj)
+            return {
+                "success": True,
+                "original": name,
+                "duplicate": new_obj.name,
+                "location": list(new_obj.location),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def set_object_visibility(self, name, hide_viewport=None, hide_render=None):
+        """Show or hide an object in the viewport and/or render."""
+        try:
+            obj = bpy.data.objects.get(name)
+            if not obj:
+                return {"error": f"Object '{name}' not found"}
+            if hide_viewport is not None:
+                obj.hide_viewport = bool(hide_viewport)
+            if hide_render is not None:
+                obj.hide_render = bool(hide_render)
+            return {
+                "success": True,
+                "name": name,
+                "hide_viewport": obj.hide_viewport,
+                "hide_render": obj.hide_render,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def parent_objects(self, child_name, parent_name, keep_transform=True):
+        """Parent *child_name* to *parent_name*."""
+        try:
+            child = bpy.data.objects.get(child_name)
+            parent = bpy.data.objects.get(parent_name)
+            if not child:
+                return {"error": f"Child '{child_name}' not found"}
+            if not parent:
+                return {"error": f"Parent '{parent_name}' not found"}
+            if keep_transform:
+                world_mat = child.matrix_world.copy()
+            child.parent = parent
+            if keep_transform:
+                child.matrix_world = world_mat
+            bpy.context.view_layer.update()
+            return {"success": True, "child": child_name, "parent": parent_name}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def join_objects(self, object_names, active_name=None):
+        """Join a list of objects into one mesh (like Ctrl+J)."""
+        try:
+            objs = []
+            for n in object_names:
+                o = bpy.data.objects.get(n)
+                if not o:
+                    return {"error": f"Object '{n}' not found"}
+                objs.append(o)
+            if len(objs) < 2:
+                return {"error": "Need at least 2 objects to join"}
+            bpy.ops.object.select_all(action='DESELECT')
+            for o in objs:
+                o.select_set(True)
+            active = bpy.data.objects.get(active_name) if active_name else objs[0]
+            if active not in objs:
+                active = objs[0]
+            bpy.context.view_layer.objects.active = active
+            bpy.ops.object.join()
+            return {
+                "success": True,
+                "result_object": bpy.context.active_object.name,
+                "joined_from": object_names,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def apply_transforms(self, object_name, location=True, rotation=True, scale=True):
+        """Apply location / rotation / scale transforms to an object."""
+        try:
+            obj = bpy.data.objects.get(object_name)
+            if not obj:
+                return {"error": f"Object '{object_name}' not found"}
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.transform_apply(
+                location=bool(location),
+                rotation=bool(rotation),
+                scale=bool(scale),
+            )
+            return {"success": True, "object": object_name}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def set_origin(self, object_name, origin_type='ORIGIN_CENTER_OF_MASS'):
+        """Set the origin of an object.
+        origin_type: ORIGIN_GEOMETRY | ORIGIN_CENTER_OF_MASS |
+                     ORIGIN_CENTER_OF_VOLUME | ORIGIN_CURSOR | GEOMETRY_ORIGIN
+        """
+        try:
+            obj = bpy.data.objects.get(object_name)
+            if not obj:
+                return {"error": f"Object '{object_name}' not found"}
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.origin_set(type=origin_type)
+            return {
+                "success": True,
+                "object": object_name,
+                "origin_type": origin_type,
+                "new_location": [round(v, 4) for v in obj.location],
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def set_smooth_shading(self, object_name, smooth=True, auto_smooth=True,
+                            auto_smooth_angle=30.0):
+        """Set smooth or flat shading on a mesh object."""
+        try:
+            obj = bpy.data.objects.get(object_name)
+            if not obj or obj.type != 'MESH':
+                return {"error": f"Mesh '{object_name}' not found"}
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            if smooth:
+                bpy.ops.object.shade_smooth()
+            else:
+                bpy.ops.object.shade_flat()
+            return {"success": True, "object": object_name, "smooth": smooth}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # MATERIALS
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def create_material(self, name, base_color=(0.8, 0.8, 0.8, 1.0),
+                         metallic=0.0, roughness=0.5,
+                         emission_color=(0.0, 0.0, 0.0, 1.0), emission_strength=0.0,
+                         alpha=1.0, ior=1.45, specular=0.5):
+        """Create or replace a PBR material using Principled BSDF."""
+        try:
+            mat = bpy.data.materials.get(name) or bpy.data.materials.new(name=name)
+            mat.use_nodes = True
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            nodes.clear()
+
+            out = nodes.new('ShaderNodeOutputMaterial')
+            out.location = (300, 0)
+            bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+            bsdf.location = (0, 0)
+            links.new(bsdf.outputs[0], out.inputs[0])
+
+            bsdf.inputs["Base Color"].default_value = (
+                float(base_color[0]), float(base_color[1]),
+                float(base_color[2]), float(base_color[3]) if len(base_color) > 3 else 1.0)
+            bsdf.inputs["Metallic"].default_value = float(metallic)
+            bsdf.inputs["Roughness"].default_value = float(roughness)
+
+            if float(alpha) < 1.0:
+                bsdf.inputs["Alpha"].default_value = float(alpha)
+                mat.blend_method = 'BLEND'
+
+            # Emission – node input name changed in Blender 4
+            ec = (float(emission_color[0]), float(emission_color[1]),
+                  float(emission_color[2]), float(emission_color[3]) if len(emission_color) > 3 else 1.0)
+            if "Emission Color" in bsdf.inputs:
+                bsdf.inputs["Emission Color"].default_value = ec
+            elif "Emission" in bsdf.inputs:
+                bsdf.inputs["Emission"].default_value = ec
+            if "Emission Strength" in bsdf.inputs:
+                bsdf.inputs["Emission Strength"].default_value = float(emission_strength)
+
+            if "IOR" in bsdf.inputs:
+                bsdf.inputs["IOR"].default_value = float(ior)
+            for sp_key in ("Specular IOR Level", "Specular"):
+                if sp_key in bsdf.inputs:
+                    bsdf.inputs[sp_key].default_value = float(specular)
+                    break
+
+            return {
+                "success": True,
+                "name": mat.name,
+                "base_color": list(base_color),
+                "metallic": metallic,
+                "roughness": roughness,
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def assign_material(self, object_name, material_name, slot_index=0):
+        """Assign an existing material to an object's slot."""
+        try:
+            obj = bpy.data.objects.get(object_name)
+            if not obj:
+                return {"error": f"Object '{object_name}' not found"}
+            mat = bpy.data.materials.get(material_name)
+            if not mat:
+                return {"error": f"Material '{material_name}' not found"}
+            if not hasattr(obj.data, 'materials'):
+                return {"error": f"'{object_name}' cannot accept materials"}
+            while len(obj.material_slots) <= slot_index:
+                bpy.ops.object.select_all(action='DESELECT')
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.object.material_slot_add()
+            obj.material_slots[slot_index].material = mat
+            return {"success": True, "object": object_name, "material": material_name, "slot": slot_index}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_material_info(self, material_name):
+        """Return the full node tree of a material."""
+        try:
+            mat = bpy.data.materials.get(material_name)
+            if not mat:
+                return {"error": f"Material '{material_name}' not found"}
+            info = {
+                "name": mat.name,
+                "users": mat.users,
+                "use_nodes": mat.use_nodes,
+                "blend_method": getattr(mat, 'blend_method', 'OPAQUE'),
+            }
+            if mat.use_nodes and mat.node_tree:
+                node_list = []
+                for node in mat.node_tree.nodes:
+                    nd = {
+                        "name": node.name,
+                        "type": node.type,
+                        "location": [round(node.location.x), round(node.location.y)],
+                        "inputs": {},
+                    }
+                    for inp in node.inputs:
+                        if hasattr(inp, 'default_value'):
+                            try:
+                                v = inp.default_value
+                                nd["inputs"][inp.name] = list(v) if hasattr(v, '__len__') else v
+                            except Exception:
+                                pass
+                    node_list.append(nd)
+                info["nodes"] = node_list
+                info["links"] = [
+                    f"{lk.from_node.name}.{lk.from_socket.name} → {lk.to_node.name}.{lk.to_socket.name}"
+                    for lk in mat.node_tree.links
+                ]
+            return info
+        except Exception as e:
+            return {"error": str(e)}
+
+    def modify_material(self, material_name, base_color=None, metallic=None,
+                         roughness=None, emission_color=None, emission_strength=None,
+                         alpha=None, ior=None):
+        """Update Principled BSDF values of an existing material."""
+        try:
+            mat = bpy.data.materials.get(material_name)
+            if not mat or not mat.use_nodes:
+                return {"error": f"Material '{material_name}' not found or has no nodes"}
+            bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            if not bsdf:
+                return {"error": "No Principled BSDF found"}
+            if base_color is not None:
+                bsdf.inputs["Base Color"].default_value = (
+                    float(base_color[0]), float(base_color[1]),
+                    float(base_color[2]), float(base_color[3]) if len(base_color) > 3 else 1.0)
+            if metallic is not None:
+                bsdf.inputs["Metallic"].default_value = float(metallic)
+            if roughness is not None:
+                bsdf.inputs["Roughness"].default_value = float(roughness)
+            if alpha is not None:
+                bsdf.inputs["Alpha"].default_value = float(alpha)
+                if float(alpha) < 1.0:
+                    mat.blend_method = 'BLEND'
+            if emission_color is not None:
+                ec = (float(emission_color[0]), float(emission_color[1]),
+                      float(emission_color[2]), float(emission_color[3]) if len(emission_color) > 3 else 1.0)
+                if "Emission Color" in bsdf.inputs:
+                    bsdf.inputs["Emission Color"].default_value = ec
+                elif "Emission" in bsdf.inputs:
+                    bsdf.inputs["Emission"].default_value = ec
+            if emission_strength is not None and "Emission Strength" in bsdf.inputs:
+                bsdf.inputs["Emission Strength"].default_value = float(emission_strength)
+            if ior is not None and "IOR" in bsdf.inputs:
+                bsdf.inputs["IOR"].default_value = float(ior)
+            return {"success": True, "material": material_name}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # MODIFIERS & UV
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def add_modifier(self, object_name, modifier_type, name=None, **params):
+        """Add any Blender modifier to an object.
+        Common modifier_type values: SUBSURF, SOLIDIFY, BEVEL, BOOLEAN,
+        MIRROR, ARRAY, DECIMATE, REMESH, SKIN, WIREFRAME, DISPLACE, etc.
+        Extra keyword arguments are applied as modifier properties.
+        """
+        try:
+            obj = bpy.data.objects.get(object_name)
+            if not obj:
+                return {"error": f"Object '{object_name}' not found"}
+            mod_name = name or modifier_type
+            mod = obj.modifiers.new(name=mod_name, type=modifier_type)
+            for key, value in params.items():
+                if hasattr(mod, key):
+                    try:
+                        setattr(mod, key, value)
+                    except Exception as e:
+                        print(f"Modifier param {key}: {e}")
+            return {
+                "success": True,
+                "object": object_name,
+                "modifier": mod.name,
+                "type": modifier_type,
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def apply_modifier(self, object_name, modifier_name):
+        """Apply (bake) a modifier permanently to the mesh."""
+        try:
+            obj = bpy.data.objects.get(object_name)
+            if not obj:
+                return {"error": f"Object '{object_name}' not found"}
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.modifier_apply(modifier=modifier_name)
+            return {"success": True, "object": object_name, "applied": modifier_name}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def uv_unwrap(self, object_name, method='SMART_PROJECT',
+                   island_margin=0.02, angle_limit=66.0):
+        """UV-unwrap a mesh.
+        method: SMART_PROJECT | UNWRAP | CUBE_PROJECT | CYLINDER_PROJECT | SPHERE_PROJECT
+        """
+        try:
+            obj = bpy.data.objects.get(object_name)
+            if not obj or obj.type != 'MESH':
+                return {"error": f"Mesh '{object_name}' not found"}
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            m = method.upper()
+            if m == 'SMART_PROJECT':
+                bpy.ops.uv.smart_project(island_margin=float(island_margin),
+                                          angle_limit=float(angle_limit))
+            elif m == 'UNWRAP':
+                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=float(island_margin))
+            elif m == 'CUBE_PROJECT':
+                bpy.ops.uv.cube_project()
+            elif m == 'CYLINDER_PROJECT':
+                bpy.ops.uv.cylinder_project()
+            elif m == 'SPHERE_PROJECT':
+                bpy.ops.uv.sphere_project()
+            else:
+                bpy.ops.object.mode_set(mode='OBJECT')
+                return {"error": f"Unknown UV method '{method}'"}
+            bpy.ops.object.mode_set(mode='OBJECT')
+            return {
+                "success": True,
+                "object": object_name,
+                "method": method,
+                "uv_layers": [u.name for u in obj.data.uv_layers],
+            }
+        except Exception as e:
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+            return {"error": str(e)}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # WORLD / ENVIRONMENT
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def set_world_environment(self, bg_color=(0.05, 0.05, 0.05, 1.0),
+                               strength=1.0, hdri_path=None):
+        """Set the world background to a solid colour or an HDRI file."""
+        try:
+            scene = bpy.context.scene
+            if not scene.world:
+                scene.world = bpy.data.worlds.new("World")
+            world = scene.world
+            world.use_nodes = True
+            nodes = world.node_tree.nodes
+            links = world.node_tree.links
+            nodes.clear()
+
+            out = nodes.new('ShaderNodeOutputWorld')
+            out.location = (200, 0)
+            bg = nodes.new('ShaderNodeBackground')
+            bg.location = (0, 0)
+            bg.inputs["Strength"].default_value = float(strength)
+            links.new(bg.outputs['Background'], out.inputs['Surface'])
+
+            if hdri_path and os.path.exists(hdri_path):
+                tc = nodes.new('ShaderNodeTexCoord')
+                tc.location = (-800, 0)
+                mp = nodes.new('ShaderNodeMapping')
+                mp.location = (-600, 0)
+                et = nodes.new('ShaderNodeTexEnvironment')
+                et.location = (-400, 0)
+                et.image = bpy.data.images.load(hdri_path)
+                links.new(tc.outputs['Generated'], mp.inputs['Vector'])
+                links.new(mp.outputs['Vector'], et.inputs['Vector'])
+                links.new(et.outputs['Color'], bg.inputs['Color'])
+                return {"success": True, "type": "hdri", "hdri_path": hdri_path, "strength": strength}
+            else:
+                c = bg_color
+                bg.inputs["Color"].default_value = (
+                    float(c[0]), float(c[1]), float(c[2]),
+                    float(c[3]) if len(c) > 3 else 1.0)
+                return {
+                    "success": True,
+                    "type": "color",
+                    "bg_color": list(bg_color),
+                    "strength": strength,
+                }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # VIEWPORT
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def set_viewport_shading(self, shading_type='MATERIAL'):
+        """Set viewport shading mode: WIREFRAME | SOLID | MATERIAL | RENDERED"""
+        try:
+            VALID = {'WIREFRAME', 'SOLID', 'MATERIAL', 'RENDERED'}
+            st = shading_type.upper()
+            if st not in VALID:
+                return {"error": f"shading_type must be one of {VALID}"}
+            for area in bpy.context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    for space in area.spaces:
+                        if space.type == 'VIEW_3D':
+                            space.shading.type = st
+                            break
+                    break
+            return {"success": True, "shading_type": st}
+        except Exception as e:
+            return {"error": str(e)}
 
     def get_polyhaven_categories(self, asset_type):
         """Get categories for a specific asset type from Polyhaven"""
